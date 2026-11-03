@@ -11,7 +11,8 @@
 ```text
 playbook/
 ├── cve-2026-98432-mitigation.yml       # 加固/回滚入口
-├── cve-2026-98432-check.yml            # 只读检查入口
+├── cve-2026-98432-check.yml            # 通用只读检查入口
+├── cve-2026-98432-postcheck.yml        # 加固后严格验收入口
 └── roles/
     ├── cve-2026-98432-mitigation/
     │   ├── defaults/main.yml           # 加固默认参数
@@ -23,11 +24,14 @@ playbook/
     │       ├── cve-2026-98432-iptables.sh.j2
     │       ├── cve-2026-98432-mitigation.service.j2
     │       └── cve-2026-98432.nft.j2   # 历史模板，当前生产路径不使用
-    └── cve-2026-98432-check/
-        ├── defaults/main.yml           # 检查参数
-        ├── tasks/main.yml              # 状态和业务健康检查
-        ├── tasks/pod_network.yml      # 可选 Pod 网络检查
-        └── files/                      # 检查脚本
+    ├── cve-2026-98432-check/
+    │   ├── defaults/main.yml           # 通用检查参数
+    │   ├── tasks/main.yml              # 状态和业务健康检查
+    │   ├── tasks/pod_network.yml       # 可选 Pod 网络检查
+    │   └── files/                      # 检查脚本
+    └── cve-2026-98432-postcheck/
+        ├── defaults/main.yml           # 加固后验收参数
+        └── tasks/main.yml              # 只读验收任务
 ```
 
 ## 2. 功能和动作总览
@@ -201,7 +205,16 @@ ansible-playbook \
   playbook/cve-2026-98432-check.yml
 ```
 
-建议同时检查 YAML/Jinja 文件没有 Tab 和未闭合模板。
+加固后验收入口也必须单独做 Ansible 语法检查：
+
+```bash
+ansible-playbook \
+  -i inventory.ini \
+  --syntax-check \
+  playbook/cve-2026-98432-postcheck.yml
+```
+
+建议同时检查 YAML/Jinja 文件没有 Tab 和未闭合模板。仅使用 YAML 解析器检查不足以发现 Ansible 的动作冲突；例如 `ansible.builtin.assert` 的 `fail_msg` 必须缩进到该模块参数下。
 
 ## 5. 第二步：执行只读检查
 
@@ -289,17 +302,44 @@ ansible-playbook \
 11. 验证规则、unit 和 sysctl；
 12. 默认不重启业务服务。
 
-执行后立即检查：
+执行后立即使用**加固后验收入口**检查（先按第 4 节执行 `--syntax-check`）：
 
 ```bash
 ansible-playbook \
   -i inventory.ini \
   --become \
   --limit app-01 \
-  playbook/cve-2026-98432-check.yml \
-  -e cve_98432_check_strict=true \
+  playbook/cve-2026-98432-postcheck.yml \
   -e cve_98432_serial=1
 ```
+
+`cve_98432_postcheck_strict` 默认是 `true`；`app-01` 应替换为 inventory 中实际主机名。验收不通过时停留在单节点，不扩大加固范围。详细检查项和选项见第 6.1 节。
+
+### 6.1 加固后验收步骤
+
+在 Ansible 控制端、仓库根目录执行。使用 jumpbox 包装命令时，先确认它通过 `ansible-playbook --list-hosts` 加载 Playbook；如果报 `conflicting action statements: ansible.builtin.assert, fail_msg`，说明控制端仍部署着存在缩进错误的版本，须先更新 `roles/cve-2026-98432-postcheck/tasks/main.yml`，再执行第 4 节的 `--syntax-check`。不要跳过语法检查。
+
+1. **限定单台已加固主机**：按上节命令执行 postcheck，默认严格模式；受管机需具备 `python3`、`ss`、`iptables` 和 `systemctl`。只读检查会短暂监听探针端口（默认 `18080`）并发起本地 TCP 连接，不会修改防火墙或 sysctl。
+2. **检查验收输出**：必须看到受管的 `filter/INPUT` hook 与 `u32` drop 规则、管理脚本 `--check` 通过、systemd unit 已启用且运行、存在时两项 sysctl 均为 `0` 且持久化文件匹配；本地普通 TCP 连接成功，DNS 和已启用的 Kubernetes 健康检查通过。发现 PoC 的 nft 表残留会失败。内核版本、启动时间、内核包、iptables 计数器及 MPTCP listener 数量作为人工复核证据输出。
+3. **可选检查外部业务连通性**：通过 `delegate_to: localhost` 从 Ansible 控制端连接业务地址/端口；下面的 `192.0.2.11` 是占位示例，应替换为已授权的目标业务地址，确认该控制端确实处于需要验证的访问路径。
+
+```bash
+ansible-playbook \
+  -i inventory.ini \
+  --become \
+  --limit app-01 \
+  playbook/cve-2026-98432-postcheck.yml \
+  -e cve_98432_serial=1 \
+  -e cve_98432_postcheck_require_remote_probe=true \
+  -e cve_98432_postcheck_remote_probe_host=192.0.2.11 \
+  -e cve_98432_postcheck_remote_probe_port=443
+```
+
+只有配置了目标地址和端口，远端 TCP 检查才会运行；`require_remote_probe=true` 要求其成功，否则严格验收失败。该探针只验证**普通 TCP 可达**，不会发送带 IPv4 Options 的报文；本地 `ip_options_probe.py` 的结果默认也仅供观察，不能证明外部流量经过宿主机 `INPUT`。仅在理解本地网络路径后，才考虑 `-e cve_98432_postcheck_require_local_options_block=true` 将本地 Options 结果纳入验收。
+
+可选：如业务负责人已确认原有 MPTCP listener 均应消失，可设置 `-e cve_98432_postcheck_require_no_mptcp_listeners=true`；默认仅报告 listener 数量，不因旧 listener 自动失败。若修改过加固 Role 的 `cve_98432_iptables_script`、`cve_98432_sysctl_file` 或 `cve_98432_unit`，postcheck 应传入同样的值。
+
+4. **记录结论**：将控制端执行结果与发行版对应内核 flavor 的安全公告核对，确认已安装包与正在运行的内核；此 Playbook 不自动判定发行版 backport 是否已修复漏洞。单机通过后，结合 SSH、负载均衡、业务错误率及容器/Pod 网络验证，再决定是否扩至小批次。B 方案始终不覆盖转发流量。
 
 灰度观察项：
 
@@ -430,6 +470,121 @@ systemctl is-enabled cve-2026-98432-mitigation.service 2>/dev/null || true
 
 重点确认 Docker/Kubernetes 既有链仍存在，且没有被整表替换。
 
+### 9.4 qplay 实际执行样例
+
+以下样例来自一次实际的 jumpbox 执行记录。`qplay` 的 `-e/--argument` 用于传递额外变量；每次调用只传一个 `-e` 参数。需要传多个变量时，放在同一个引号字符串中，避免包装器只保留最后一个参数。
+
+#### 9.4.1 未加固主机只读检查
+
+```bash
+qplay /usr/local/deploy/playbook/security-hardening/cve-2026-98432-check.yml \
+  -i ./h
+```
+
+示例结果：
+
+```text
+host: jf280
+kernel: 5.15.0-46-generic
+mptcp=0, migrate=0
+unit=absent, backend=absent, rules=absent
+local probe: normal_connect=True, ip_options_connect=True
+health: dns=ok
+```
+
+这表示该主机未发现本 Playbook 创建的 systemd unit、iptables 后端和规则；普通连接与带 IPv4 Options 的本地连接均成功。由于默认未启用严格模式，此命令只报告状态，不阻止执行。
+
+#### 9.4.2 执行加固
+
+```bash
+qplay \
+  -e 'cve_98432_action=enforce' \
+  /usr/local/deploy/playbook/security-hardening/cve-2026-98432-mitigation.yml \
+  -i ./h
+```
+
+示例结果摘要：
+
+```text
+host: xs5039
+changed=6, failed=0
+rules=verified
+scope=host-local-IPv4-TCP-filter-INPUT
+```
+
+`changed=6` 表示首次加固创建或修改了备份、sysctl、模块加载文件、iptables 脚本和 systemd unit 等对象。实际业务执行前仍应先限制为单台主机并使用维护窗口。
+
+#### 9.4.3 执行回滚
+
+```bash
+qplay \
+  -e 'cve_98432_action=rollback' \
+  /usr/local/deploy/playbook/security-hardening/cve-2026-98432-mitigation.yml \
+  -i ./h
+```
+
+示例结果摘要：
+
+```text
+host: xs5039
+rollback=verified
+Only owned filter/INPUT rules were removed
+changed=4, failed=0
+```
+
+执行回滚前必须确认可信备份存在，至少包括：
+
+```text
+/var/lib/cve-2026-98432/backup/manifest       # 包含 complete=1
+/var/lib/cve-2026-98432/backup/runtime-state
+```
+
+回滚会移除本方案的防护规则并恢复原始 sysctl/文件状态，可能重新暴露漏洞触发面。
+
+#### 9.4.4 回滚后验证
+
+```bash
+qplay \
+  -e 'cve_98432_serial=1' \
+  /usr/local/deploy/playbook/security-hardening/cve-2026-98432-check.yml \
+  -i ./h
+```
+
+预期的回滚后状态应是：
+
+```text
+unit=absent
+backend=absent
+rules=absent
+```
+
+同时，本地探针通常应显示：
+
+```text
+normal_connect=True
+ip_options_connect=True
+```
+
+如果回滚后仍看到：
+
+```text
+unit=enabled
+backend=iptables-filter-input
+rules=present
+ip_options_connect=False
+```
+
+则不能判定回滚成功。应立即停止后续操作，核对以下事项：
+
+1. 回滚命令是否确实输出 `included .../tasks/rollback.yml`，且不是 `Rollback mitigation skipping`；
+2. `qplay` 是否加载了正确的 Playbook 路径和 inventory；
+3. 目标是否仍为同一主机；
+4. 控制端是否使用了最新修复后的 Role；
+5. 是否存在 systemd 自动启动或其他配置管理任务重新创建规则；
+6. 是否读取了旧的检查输出或旧日志。
+
+> 现场记录中，`xs5039` 的回滚步骤输出了 `rollback=verified`，但后续另一段检查仍显示 `unit=enabled`、`rules=present`、`ip_options_connect=False`。两组结果互相矛盾，不能作为同一次回滚后的连续证据；应重新执行上述验证并保留完整时间戳、目标主机和 Playbook 路径。
+
 ## 10. 失败和中止策略
 
 以下情况应立即停止批量执行并人工检查：
@@ -467,11 +622,14 @@ systemctl restart kubelet
 
 ## 12. 版本与仓库
 
-当前版本：
+版本状态：
 
 ```text
-v1.0
+v1.2：已发布，但包含 postcheck 的 assert/fail_msg 缩进缺陷
+v1.3：本次待提交版本，包含缩进修复、README 加固后检查步骤及 qplay 实际执行样例
 ```
+
+`v1.2` 不应被视为已完成实机验收；使用 postcheck 前必须同步 `v1.3` 或更高版本，并先通过 `--syntax-check`。
 
 远端仓库：
 
